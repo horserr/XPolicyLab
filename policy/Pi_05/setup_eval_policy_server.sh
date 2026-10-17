@@ -25,9 +25,13 @@ action_dim=$(bash "${UTILS_DIR}/get_action_dim.sh" "${BENCH_ROOT}" "${env_cfg_ty
 
 echo "[SERVER] policy=${policy_name}, task=${task_name}, port=${policy_server_port}, action_dim=${action_dim}"
 
-CONDA_BASE="$(conda info --base)"
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-YAML_PYTHON="${CONDA_BASE}/bin/python"
+if command -v conda >/dev/null 2>&1; then
+    CONDA_BASE="$(conda info --base)"
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    YAML_PYTHON="${CONDA_BASE}/bin/python"
+else
+    YAML_PYTHON="$(command -v python)"
+fi
 
 resolve_uv_env() {
     local raw_path=$1
