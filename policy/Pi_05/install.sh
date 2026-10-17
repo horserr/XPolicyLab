@@ -2,6 +2,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The devcontainer sets VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT=/opt/venv globally (RoboTwin eval env).
+# Unset them so `uv sync` below targets this project's own venv (openpi/.venv, Python 3.11+)
+# instead of /opt/venv (Python 3.10).
+unset VIRTUAL_ENV UV_PROJECT_ENVIRONMENT
+
 POLICY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPENPI_ROOT="${POLICY_DIR}/openpi"
 XPOLICYLAB_ROOT="$(cd "${POLICY_DIR}/../.." && pwd)"
