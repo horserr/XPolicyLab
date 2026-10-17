@@ -21,7 +21,11 @@ if command -v conda >/dev/null 2>&1; then
     conda activate "${eval_env_conda_env}"
     echo -e "\033[34m[CLIENT] Activating Conda environment: ${eval_env_conda_env}\033[0m"
 else
-    echo -e "\033[34m[CLIENT] No conda detected; using ambient environment\033[0m"
+    # No conda: force the RoboTwin eval env so a stray activated venv
+    # (e.g. openpi/.venv) in the parent shell can't leak into the client.
+    export VIRTUAL_ENV="${UV_PROJECT_ENVIRONMENT:-/opt/venv}"
+    export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+    echo -e "\033[34m[CLIENT] No conda detected; using ${VIRTUAL_ENV}\033[0m"
 fi
 echo -e "\033[34m[CLIENT] Connecting to server ${policy_server_ip}:${policy_server_port}...\033[0m"
 echo -e "\033[34m[CLIENT] Watch for green [CONNECTED]; yellow [RECONNECT] means the client is retrying.\033[0m"
