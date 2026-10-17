@@ -66,8 +66,17 @@ if [[ ! -f "${policy_uv_env_path}/.venv/bin/activate" ]]; then
 fi
 
 echo "[SERVER] Activating uv environment: ${policy_uv_env_path}/.venv"
+# Use the venv interpreter explicitly: `command -v python` can silently fall back
+# to another interpreter present on PATH (e.g. /opt/venv) when the venv's python
+# symlink is dangling, which yields confusing ModuleNotFoundError later on.
+PYTHON_BIN="${policy_uv_env_path}/.venv/bin/python"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    echo "[SERVER][ERROR] uv venv python not usable: ${PYTHON_BIN}" >&2
+    echo "[SERVER][ERROR] Run: bash ${SCRIPT_DIR}/install.sh  (or: uv python install 3.11)" >&2
+    exit 1
+fi
 source "${policy_uv_env_path}/.venv/bin/activate"
-PYTHON_BIN="$(command -v python)"
+hash -r 2>/dev/null || true
 OPENPI_SRC="${policy_uv_env_path}/src"
 echo "[SERVER] Using python: ${PYTHON_BIN}"
 
