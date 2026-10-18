@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.3
 
 bench_name=$1

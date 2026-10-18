@@ -1,5 +1,9 @@
 #!/bin/bash
 set -euo pipefail
+# Do not pre-reserve 30% of VRAM: on shared GPUs (another tenant already using
+# several GB) the pre-allocation starves sapien's renderer, which then fails with
+# "RuntimeError: cannot create buffer" during camera capture.
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.3
 
 bench_name=$1
