@@ -140,6 +140,17 @@ sm_120 (RTX 5090)**. This fork is run with:
 The Qwen wrapper falls back from `flash_attention_2` to `sdpa` when `flash_attn` is absent, so no
 source build of flash-attn is required for inference.
 
+#### Installing flash-attn (optional, for `flash_attention_2`)
+
+Pre-built `flash-attn` wheels for cu128 / torch 2.7 are published on Astral's GPU index — no source
+build (which is what breaks on sm_120). Install into the policy venv with:
+
+    uv pip install "flash-attn>=2.8.3" --index-url https://wheels.astral.sh/simple/cu128
+
+The RMBench root `pyproject.toml` declares this as the `policy` extra (with
+`[tool.uv.sources] flash-attn = { index = "astral-cu128" }`), so `uv sync --extra policy` also
+installs it. Without flash-attn the wrapper falls back to `sdpa` (correct, just slower).
+
 ### Policy-env dependency pins (no conda)
 
 The upstream `install.sh` installs the *latest* `diffusers`, which pulls `huggingface-hub>=1.0`

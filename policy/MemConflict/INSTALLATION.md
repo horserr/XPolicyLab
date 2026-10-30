@@ -14,6 +14,11 @@ bash install.sh mem0
 
 `install.sh` creates the `mem0` conda env (Python 3.10, PyTorch 2.6 + CUDA 12.4), installs `Mem_0/requirements.txt`, flash-attn, ffmpeg, and editable `XPolicyLab`.
 
+**No conda / cu128 (sm_120, RTX 5090):** the `install.sh` flash-attn pin needs a source build that
+does not run on sm_120. Install a pre-built wheel from Astral instead:
+
+    uv pip install "flash-attn>=2.8.3" --index-url https://wheels.astral.sh/simple/cu128
+
 ## 2. Planning training env (`llama_factory`, Mn tasks)
 
 ```bash
