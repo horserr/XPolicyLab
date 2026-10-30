@@ -319,6 +319,7 @@ class Model(ModelTemplate):
     # Deploy RPC (primary eval path)
     # ------------------------------------------------------------------ #
     def begin_episode(self, obs):
+        self._maybe_save_memory_trajectory()
         os.makedirs(TMP_VISUAL, exist_ok=True)
         encoded = self.encode_obs(obs)
         rgb = encoded["_rgb"]
@@ -400,6 +401,7 @@ class Model(ModelTemplate):
         raise NotImplementedError(self._error_msg("Mem_0 does not support batch inference."))
 
     def reset(self):
+        self._maybe_save_memory_trajectory()
         self.agent.reset()
         self.agent.task_type = self.task_type
         self._chunk_queue = []
@@ -418,3 +420,21 @@ class Model(ModelTemplate):
     def get_conflict_log(self):
         """Recorded anchor-vs-window conflict events."""
         return self.agent.executor.memory_bank.get_conflict_log()
+
+    def save_memory_trajectory(self, path):
+        """Write per-step (anchor, window) vectors to .npz for PCA/visualization."""
+        return self.agent.executor.memory_bank.save_trajectory(path)
+
+    def _maybe_save_memory_trajectory(self):
+        """Auto-save the memory trajectory when MEMC_SAVE_TRAJECTORY is set.
+
+        Called at episode boundaries (begin_episode / reset) so the per-step
+        anchor/window vectors are persisted without changing eval semantics.
+        """
+        _save_path = os.environ.get("MEMC_SAVE_TRAJECTORY")
+        if not _save_path:
+            return
+        try:
+            self.save_memory_trajectory(_save_path)
+        except Exception as _e:  # never break eval over a probe write
+            cprint(f"[Mem_0] save_memory_trajectory failed: {_e}", "red")

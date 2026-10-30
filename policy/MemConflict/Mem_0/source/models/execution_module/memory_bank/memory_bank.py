@@ -245,6 +245,8 @@ class MemoryBank(nn.Module):
         # MemoryConflict: per-episode conflict event log + running step counter.
         self.conflict_log = []
         self._conflict_step = 0
+        # MemoryConflict: per-step (anchor, window) vector trajectory for PCA/visualization.
+        self._trajectory = {}
 
     def forward(
         self, 
@@ -730,6 +732,16 @@ class MemoryBank(nn.Module):
                     f"conflict={conflict} anchor_len={_a_len} window_len={_w_len} resolution={self.resolution}",
                     "red" if conflict else "cyan",
                 )
+                # Record per-step (anchor, window) vectors for PCA/visualization.
+                _rec_tensor, _rec_alen, _rec_wlen = memory_result
+                if _rec_alen > 0 and _rec_wlen > 0:
+                    self._trajectory.setdefault(_norm_eid(episode_id), []).append({
+                        "step": self._conflict_step,
+                        "anchor": _rec_tensor[:_rec_alen].mean(dim=0).detach().float().cpu().numpy(),
+                        "window": _rec_tensor[_rec_alen + _rec_wlen - 1].detach().float().cpu().numpy(),
+                        "anchor_sim": anchor_sim,
+                        "conflict": conflict,
+                    })
 
         if memory_result is None:
             # No memory exists: return current vector with proper shape (1, 1, H)
@@ -904,3 +916,20 @@ class MemoryBank(nn.Module):
     def get_conflict_log(self) -> list:
         """Return the recorded conflict events (a copy)."""
         return list(self.conflict_log)
+
+    def save_trajectory(self, path: str) -> str:
+        """Write per-step (anchor, window) vectors to a .npz (MemoryConflict).
+
+        Each episode ``eid`` produces keys ``eid_<eid>_step/_anchor/_window/_anchor_sim/_conflict``.
+        Returns the path written (for chaining/assertions).
+        """
+        arrays = {}
+        for eid, rows in self._trajectory.items():
+            prefix = f"eid_{eid}"
+            arrays[f"{prefix}_step"] = np.asarray([r["step"] for r in rows], dtype=np.int64)
+            arrays[f"{prefix}_anchor"] = np.stack([r["anchor"] for r in rows])
+            arrays[f"{prefix}_window"] = np.stack([r["window"] for r in rows])
+            arrays[f"{prefix}_anchor_sim"] = np.asarray([r["anchor_sim"] for r in rows], dtype=np.float32)
+            arrays[f"{prefix}_conflict"] = np.asarray([r["conflict"] for r in rows], dtype=bool)
+        np.savez_compressed(path, **arrays)
+        return path
