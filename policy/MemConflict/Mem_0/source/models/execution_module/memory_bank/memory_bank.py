@@ -8,6 +8,18 @@ import numpy as np
 import math
 
 
+def _norm_eid(eid):
+    """Normalize an episode id to a Python int/str scalar for stable dict keys."""
+    try:
+        if isinstance(eid, torch.Tensor) and eid.numel() == 1:
+            return int(eid.item())
+        if isinstance(eid, np.generic):
+            return int(eid)
+    except Exception:
+        pass
+    return eid
+
+
 class PositionEmbedder(nn.Module):
     """
     Embeds relative positions into vector representations using sinusoidal embeddings.
@@ -115,6 +127,11 @@ class MemoryBank(nn.Module):
         frequency_embedding_size: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        enable_window: bool = True,
+        enable_anchor: bool = True,
+        resolution: str = "none",
+        dump_memory: bool = False,
+        conflict_threshold: float = 0.85,
     ):
         """
         Initialize MemoryBank.
@@ -138,7 +155,13 @@ class MemoryBank(nn.Module):
         self.device = device
         self.dtype = dtype
         self.memory_accumulation = memory_accumulation
-        
+        # MemoryConflict instrumentation (defaults preserve upstream Mem_0 behavior)
+        self.enable_window = enable_window
+        self.enable_anchor = enable_anchor
+        self.resolution = resolution
+        self.dump_memory_enabled = dump_memory
+        self.conflict_threshold = conflict_threshold
+
         # Relative position encoder for sliding window only
         # Position encoding optimized for window_size=30 (max_period=30 in position_embedding)
         # Note: anchor does not use positional encoding (single frame, no temporal ordering)
@@ -218,7 +241,11 @@ class MemoryBank(nn.Module):
         
         # Optional debug flag controlled externally
         self.debug = False
-        
+
+        # MemoryConflict: per-episode conflict event log + running step counter.
+        self.conflict_log = []
+        self._conflict_step = 0
+
     def forward(
         self, 
         new_vector: torch.Tensor,
@@ -410,7 +437,26 @@ class MemoryBank(nn.Module):
         memory_tensor = torch.cat(tensors, dim=0)
         
         return memory_tensor, len(anchors), len(window)
-    
+
+    def _anchor_window_similarity(self, memory_tensor, anchor_len, window_len):
+        """
+        Cosine similarity between the anchor memory (mean-pooled) and the most
+        recent window vector. A low score means the recent history has diverged
+        from the task-initial anchor -- the memory-conflict signal.
+        """
+        if anchor_len == 0 or window_len == 0:
+            return None
+        anchor_vec = memory_tensor[:anchor_len].mean(dim=0, keepdim=True).float()  # (1, H)
+        latest_window = memory_tensor[anchor_len + window_len - 1: anchor_len + window_len].float()  # (1, H)
+        return float(nn.functional.cosine_similarity(anchor_vec, latest_window, dim=-1).item())
+
+    def _set_anchor(self, episode_id, vector):
+        """Force-replace the anchor for an episode (refresh_anchor resolution)."""
+        episode_id = _norm_eid(episode_id)
+        if episode_id not in self.bank:
+            self.bank[episode_id] = {"anchors": [], "window": []}
+        self.bank[episode_id]["anchors"] = [vector.detach().clone()]
+
     def _upd_to_window(
         self,
         episode_id: int,
@@ -540,7 +586,7 @@ class MemoryBank(nn.Module):
                 q = current_vector.unsqueeze(1)  # (1, H) -> (1, 1, H)    
                 
                 # Cross-attention with sliding window
-                if window_len > 0:
+                if self.enable_window and window_len > 0:
                     # get sliding window memory
                     window_mem = memory_tensor[anchor_len:]  # (window_len, H)
                     
@@ -565,7 +611,7 @@ class MemoryBank(nn.Module):
                     fused_sliding_vector = q  # (1, 1, H)
                 
                 # Cross-attention with anchor
-                if anchor_len > 0:
+                if self.enable_anchor and anchor_len > 0:
                     # get anchor memory
                     anchor_mem = memory_tensor[:anchor_len]  # (anchor_len, H)
                     
@@ -583,8 +629,10 @@ class MemoryBank(nn.Module):
             
             # Update memory bank: anchor and window together
             # Always update both anchor and window (anchor update only happens if anchor is empty)
-            self._upd_to_window(current_eid, current_vector)
-            self._upd_to_anchor(current_eid, current_vector)
+            if self.enable_window:
+                self._upd_to_window(current_eid, current_vector)
+            if self.enable_anchor:
+                self._upd_to_anchor(current_eid, current_vector)
             
             # Update end signal count and clear memory if threshold reached
             sub_end_flag = subtask_end_flags[i] if subtask_end_flags is not None else False
@@ -653,7 +701,36 @@ class MemoryBank(nn.Module):
         
         # Get stored memory for this episode (after updating anchor)
         memory_result = self._get_memory_tensor(episode_id)
-        
+
+        # --- MemoryConflict: detect anchor vs recent-window divergence ---
+        conflict = False
+        anchor_sim = None
+        if memory_result is not None:
+            _mem_tensor, _a_len, _w_len = memory_result
+            anchor_sim = self._anchor_window_similarity(_mem_tensor, _a_len, _w_len)
+            if anchor_sim is not None and anchor_sim < self.conflict_threshold:
+                conflict = True
+                self.conflict_log.append({
+                    "episode_id": _norm_eid(episode_id),
+                    "step": self._conflict_step,
+                    "anchor_sim": anchor_sim,
+                    "anchor_len": _a_len,
+                    "window_len": _w_len,
+                    "resolution": self.resolution,
+                })
+                if self.enable_anchor and self.resolution == "refresh_anchor":
+                    # Re-anchor to the current state so the stale initial anchor no
+                    # longer drags the action back toward a diverged regime.
+                    self._set_anchor(episode_id, current_vector)
+                    memory_result = self._get_memory_tensor(episode_id)
+            self._conflict_step += 1
+            if self.dump_memory_enabled:
+                cprint(
+                    f"[mem] eid={_norm_eid(episode_id)} anchor_sim={None if anchor_sim is None else round(anchor_sim, 4)} "
+                    f"conflict={conflict} anchor_len={_a_len} window_len={_w_len} resolution={self.resolution}",
+                    "red" if conflict else "cyan",
+                )
+
         if memory_result is None:
             # No memory exists: return current vector with proper shape (1, 1, H)
             fused_sliding_vector = current_vector.unsqueeze(1)  # (1, H) -> (1, 1, H)
@@ -663,9 +740,16 @@ class MemoryBank(nn.Module):
             memory_tensor = memory_tensor.to(dtype=current_vector.dtype)
             
             q = current_vector.unsqueeze(1)  # (1, H) -> (1, 1, H)
-            
+
+            # reweight_window resolution: on conflict, suppress the stale anchor so
+            # the recent window drives the action. (refresh_anchor already replaced
+            # the anchor above, so no suppression is needed there.)
+            suppress_anchor = conflict and self.resolution == "reweight_window"
+            use_anchor = self.enable_anchor and not suppress_anchor
+            use_window = self.enable_window
+
             # Cross-attention with sliding window
-            if window_len > 0:
+            if use_window and window_len > 0:
                 # Get sliding window memory
                 window_mem = memory_tensor[anchor_len:]  # (window_len, H)
                 
@@ -690,7 +774,7 @@ class MemoryBank(nn.Module):
                 fused_sliding_vector = q  # (1, 1, H)
             
             # Cross-attention with anchor
-            if anchor_len > 0:
+            if use_anchor and anchor_len > 0:
                 # get anchor memory
                 anchor_mem_raw = memory_tensor[:anchor_len]  # (anchor_len, H)
                 
@@ -707,9 +791,11 @@ class MemoryBank(nn.Module):
                 fused_anchor_vector = q  # (1, 1, H)
         
         # Update memory bank: update window with original vector
-        self._upd_to_window(episode_id, current_vector)
+        if self.enable_window:
+            self._upd_to_window(episode_id, current_vector)
         # Update anchor with original vector
-        self._upd_to_anchor(episode_id, current_vector)
+        if self.enable_anchor:
+            self._upd_to_anchor(episode_id, current_vector)
         
         summary_vector = torch.cat([fused_sliding_vector, fused_anchor_vector, text_vector], dim=2) #(1, 1, 3*H)
         
@@ -799,3 +885,22 @@ class MemoryBank(nn.Module):
         
         # Restore eid_stream
         self.eid_stream = saved_state["eid_stream"]
+
+    def dump_memory(self, episode_id: Optional[Union[int, str]] = None) -> dict:
+        """
+        Read-only snapshot of the memory bank for probing (MemoryConflict).
+        Vectors are detached, cast to float32, and moved to CPU as numpy arrays.
+        """
+        def _entry(entry):
+            return {
+                "anchors": [v.detach().cpu().float().numpy() for v in entry.get("anchors", [])],
+                "window": [v.detach().cpu().float().numpy() for v in entry.get("window", [])],
+            }
+
+        if episode_id is not None:
+            return _entry(self.bank.get(_norm_eid(episode_id), {}))
+        return {str(eid): _entry(entry) for eid, entry in self.bank.items()}
+
+    def get_conflict_log(self) -> list:
+        """Return the recorded conflict events (a copy)."""
+        return list(self.conflict_log)

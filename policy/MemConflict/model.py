@@ -36,12 +36,20 @@ UPSTREAM_DIR = os.path.join(CURRENT_DIR, "Mem_0")
 if UPSTREAM_DIR not in sys.path:
     sys.path.insert(0, UPSTREAM_DIR)
 
-from scripts.tools_for_deploy.image_utils import to_pil  # noqa: E402
-from scripts.tools_for_deploy.layout_utils import (  # noqa: E402
+# `scripts.tools_for_deploy` must NOT be imported via the `scripts` package: the
+# benchmark repo ships an empty `scripts/__init__.py`, which turns `scripts` into a
+# regular package that shadows this vendored namespace package. Import the leaf
+# modules by putting their directory on sys.path instead.
+_TFD_DIR = os.path.join(UPSTREAM_DIR, "scripts", "tools_for_deploy")
+if _TFD_DIR not in sys.path:
+    sys.path.insert(0, _TFD_DIR)
+
+from image_utils import to_pil  # noqa: E402
+from layout_utils import (  # noqa: E402
     env_to_model_layout,
     model_to_env_layout,
 )
-from scripts.tools_for_deploy.normlization import (  # noqa: E402
+from normlization import (  # noqa: E402
     denormalize_arms,
     load_stats,
     normalize_arms,
@@ -399,3 +407,14 @@ class Model(ModelTemplate):
         self._need_obs_update = False
         self._last_rgb = None
         cprint(f"[Mem_0] reset (episode {self.agent.episode_id})", "cyan")
+
+    # ------------------------------------------------------------------ #
+    # MemoryConflict instrumentation (read-only probes)
+    # ------------------------------------------------------------------ #
+    def dump_memory(self, episode_id=None):
+        """Snapshot of the executor MemoryBank (anchors + window) for probing."""
+        return self.agent.executor.memory_bank.dump_memory(episode_id=episode_id)
+
+    def get_conflict_log(self):
+        """Recorded anchor-vs-window conflict events."""
+        return self.agent.executor.memory_bank.get_conflict_log()

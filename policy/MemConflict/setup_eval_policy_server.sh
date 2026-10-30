@@ -66,8 +66,15 @@ echo -e "\033[33m[SERVER] state_stats_path=${state_stats_path}\033[0m"
 echo -e "\033[33m[SERVER] vllm_url=${vllm_url:-<unset>}\033[0m"
 echo -e "\033[33m[SERVER] host=${policy_server_host} port=${policy_server_port}\033[0m"
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "${policy_conda_env}"
+if command -v conda >/dev/null 2>&1; then
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    conda activate "${policy_conda_env}"
+else
+    # No conda: use the MemConflict policy venv (see README "Environment notes").
+    POLICY_VENV="${MEMC_POLICY_VENV:-${BENCH_ROOT}/.policy-venv}"
+    export PATH="${POLICY_VENV}/bin:${PATH}"
+    echo -e "\033[33m[SERVER] no conda; using policy venv ${POLICY_VENV}\033[0m"
+fi
 
 action_dim=$(bash "${UTILS_DIR}/get_action_dim.sh" "${BENCH_ROOT}" "${env_cfg_type}")
 echo -e "\033[33m[SERVER] action_dim=${action_dim}\033[0m"

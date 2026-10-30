@@ -63,6 +63,11 @@ policy_server_ip="localhost"
 vllm_url="${VLLM_URL:-}"
 
 additional_info="ckpt_name=${ckpt_name},action_type=${action_type},task_type=${task_type}"
+# MemConflict: allow overriding downstream eval args (e.g. test_num=5) via
+# MEMC_ADDITIONAL_INFO="test_num=5,instruction_type=unseen".
+if [[ -n "${MEMC_ADDITIONAL_INFO:-}" ]]; then
+    additional_info="${additional_info},${MEMC_ADDITIONAL_INFO}"
+fi
 
 wait_for_port() {
     bash "${UTILS_DIR}/wait_for_policy_server.sh" "$1" "$2" "$3" "$4" 1200

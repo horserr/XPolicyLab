@@ -51,6 +51,16 @@ class MemoryMattersExecutor(nn.Module):
         num_heads = memory_bank_config.get("num_heads", 8)
         memory_bank_dropout = memory_bank_config.get("dropout", 0.1)
         memory_accumulation = memory_bank_config.get("memory_accumulation", 8)
+        # MemoryConflict instrumentation (deploy.yml keys; each overridable via env
+        # for demo/ablation runs without editing deploy.yml).
+        def _env_flag(name, default):
+            return os.environ.get(name, str(default).lower()) in ("1", "true", "yes", "on")
+
+        enable_window = _env_flag("MEMC_ENABLE_WINDOW", memory_bank_config.get("enable_window", True))
+        enable_anchor = _env_flag("MEMC_ENABLE_ANCHOR", memory_bank_config.get("enable_anchor", True))
+        resolution = os.environ.get("MEMC_RESOLUTION", memory_bank_config.get("resolution", "none"))
+        dump_memory = _env_flag("MEMC_DUMP_MEMORY", memory_bank_config.get("dump_memory", False))
+        conflict_threshold = float(os.environ.get("MEMC_CONFLICT_THRESHOLD", memory_bank_config.get("conflict_threshold", 0.85)))
         # get action model config
         action_model_config = config.execution_module.get("action_model", {})
         self.action_horizon = action_model_config.get("action_horizon", 16)
@@ -80,6 +90,11 @@ class MemoryMattersExecutor(nn.Module):
             num_heads=num_heads,
             dropout=memory_bank_dropout,
             memory_accumulation=memory_accumulation,
+            enable_window=enable_window,
+            enable_anchor=enable_anchor,
+            resolution=resolution,
+            dump_memory=dump_memory,
+            conflict_threshold=conflict_threshold,
             dtype=torch.bfloat16,
             device=device,
         )

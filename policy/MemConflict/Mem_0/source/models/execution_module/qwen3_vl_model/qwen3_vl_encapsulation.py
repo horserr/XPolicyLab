@@ -8,6 +8,7 @@ A lightweight encapsulation of Qwen3-VL.
 """
 import os
 import sys
+import importlib.util
 from typing import List, Optional, Tuple, Dict
 from tqdm import tqdm
 import torch
@@ -31,10 +32,14 @@ class Qwen3VL_Encapsulation(nn.Module):
         target_device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         device_map = {"": target_device} if target_device.type == "cuda" else None
 
+        # MemoryConflict: use flash-attention when available, else fall back to SDPA so
+        # the policy runs without a (slow, sm_120-specific) flash-attn source build.
+        _attn_impl = "flash_attention_2" if importlib.util.find_spec("flash_attn") is not None else "sdpa"
+
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_path,
             dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_attn_impl,
             device_map=device_map,
         )
         self.processor = AutoProcessor.from_pretrained(model_path)

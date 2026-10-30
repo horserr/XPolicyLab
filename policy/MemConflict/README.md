@@ -1,83 +1,186 @@
-# Mem_0
+# MemConflict
 
-**Contributor:** RoboDojo Team | **Paper:** Mem-0 technical report | **arXiv:** TBD | **Original code:** See vendored `Mem_0/`.
+**Fork of `Mem_0` that instruments, demonstrates, and resolves memory conflict.**
 
-`Mem_0` adapts the Mem-0 policy to XPolicyLab/RoboDojo. It pairs a Qwen3-VL-2B execution module with a Qwen3-VL-8B planning module: single-stage tasks use task type `M1` (execution only), multi-stage tasks use `Mn` (planning + execution, with planning served via vLLM at eval). Integration scripts live at this directory level; the vendored upstream implementation lives in `Mem_0/`.
+`Mem_0` fuses every step through a two-branch `MemoryBank`:
 
-Shared conventions — argument meanings, checkpoint naming, split-machine deployment, `EVAL_ENV_TYPE` — are documented in the [XPolicyLab README](../../README.md). Official results: [RoboDojo LeaderBoard](https://robodojo-benchmark.com/LeaderBoard).
+- **window** — a sliding FIFO of the most recent hidden states (recent history, `window_size=30`),
+- **anchor** — the task-initial state (`initial_anchor_size=1`, never replaced during an episode).
 
-## Installation
+The two branches are cross-attended separately and concatenated with the text token into the
+`(B, 3, H)` summary that drives the DiT action head. When an episode drifts far from its start —
+a bimanual robot swapping blocks, so the workspace is visibly different by the end — the
+*recent history* and the *task-initial anchor* point in different directions. The anchor keeps
+dragging the fused representation back toward the initial state even though that state is now
+stale. That divergence is the **memory conflict** this adapter makes visible.
 
-```bash
-cd XPolicyLab/policy/Mem_0
-bash install.sh mem0  # optional arg: conda env name
-conda activate <policy_env>  # e.g. mem0
+This fork changes **nothing about `Mem_0`'s default behavior**; every new switch defaults to the
+upstream value. The instrumentation lives entirely under `policy/MemConflict/`. The vendored
+upstream is kept at its original path `MemConflict/Mem_0/`, so `model.py`'s `UPSTREAM_DIR`
+reference is unchanged.
+
+## New `deploy.yml` keys (`execution_module.memory_bank`)
+
+| key | default | meaning |
+| --- | --- | --- |
+| `enable_window` | `true` | gate the sliding-window branch (cross-attn **and** window write) |
+| `enable_anchor` | `true` | gate the anchor branch (cross-attn **and** anchor write) |
+| `resolution` | `none` | `none` \| `reweight_window` \| `refresh_anchor` |
+| `dump_memory` | `false` | print `anchor_sim` / sizes / conflict flag every eval step |
+| `conflict_threshold` | `0.85` | cosine(anchor, latest window) below this ⇒ a conflict event |
+
+These are read in `memorymatters_executor.py` and forwarded into `MemoryBank.__init__`, so they
+also work if you drive the executor directly.
+
+Every one of the five keys is also overridable via an env var at eval time (mirroring the
+`MEM0_*` convention), so a demo/ablation run can change conflict behavior without editing
+`deploy.yml`:
+
+| env var | overrides |
+| --- | --- |
+| `MEMC_ENABLE_WINDOW` | `enable_window` |
+| `MEMC_ENABLE_ANCHOR` | `enable_anchor` |
+| `MEMC_RESOLUTION` | `resolution` |
+| `MEMC_DUMP_MEMORY` | `dump_memory` |
+| `MEMC_CONFLICT_THRESHOLD` | `conflict_threshold` |
+
+Additionally, `MEMC_ADDITIONAL_INFO="test_num=5,instruction_type=unseen"` appends extra
+`key=value` args to the env-client eval invocation (e.g. to cap episodes for a demo).
+
+## What "conflict" means here, concretely
+
+At every eval step (`MemoryBank.update_on_eval`), the adapter computes
+
+```
+anchor_sim = cosine( mean(anchor), latest_window_vector )
 ```
 
-Read `INSTALLATION.md` before first use: Mem_0 uses three environments — `mem0` (execution/inference, created by `install.sh`), `llama_factory` (planning training, created by `install_planning.sh`), and `vllm` (Mn planning inference, name overridable via `CONDA_ENV_VLLM`) — plus Qwen3-VL-2B/8B backbone downloads via `python scripts/_download.py` that `install.sh` does not perform.
+where `latest_window_vector` is the most recent hidden state in the FIFO. When
+`anchor_sim < conflict_threshold`, a `conflict` event is recorded in `MemoryBank.conflict_log`
+(one dict per event: `episode_id`, `step`, `anchor_sim`, `anchor_len`, `window_len`, `resolution`).
 
-## Data Processing
+This is a **read-only detector** — it never changes the model. The *resolution* switch is what
+acts on the event:
 
-Converts XPolicyLab trajectory HDF5 into a Mem_0 LeRobot dataset at `data/<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>-lerobot`. The optional `task_type` argument selects `M1` (single-stage, default) or `Mn` (multi-stage planning; needs `language_annotation.json` via `LANGUAGE_ANNOTATION` unless an annotation already exists under `Mem_0/xpolicylab_adapter/language_annotation/<task>/`). `TASK_INSTRUCTION` optionally sets the M1 instruction / Mn global task (default `<ckpt_name>`).
+- `none` — record but do nothing (baseline; reproduces `Mem_0` exactly).
+- `reweight_window` — on a conflict step, **suppress the anchor branch** so the recent window
+  drives the action. The stored anchor is left untouched (a soft, per-step reweighting).
+- `refresh_anchor` — on a conflict step, **re-anchor to the current state** (replace the stored
+  anchor). The stale initial state is dropped and the memory tracks the new regime (a hard memory
+  update).
 
-The output keys deviate from the [official LeRobot converters](../../README.md#official-lerobot-conversion): a single `observation.image.head_camera` view, a 16-dim `observation.state`, and per-episode subtask annotations for Mn planning. Only the bundled `Mem_0/xpolicylab_adapter/xpolicylab_to_lerobot.py` (which `process_data.sh` invokes) produces this layout; official-converter output is not consumed directly.
+## Probes (read-only)
 
-Frames come from the trajectory image bits through `decode_image_bit`, so training sees the same RGB that evaluation feeds. The converters also accept `--use-preview` (`USE_PREVIEW=1` for the multi-task `process_data_batch.sh`), which skips the per-frame JPEG decode by reading `preview_video/episode_*_<camera>.mp4` instead. That is faster, but those files are written outside XPolicyLab, so their channel order is not guaranteed — only opt in for previews you know store true RGB.
-
-```bash
-cd XPolicyLab/policy/Mem_0
-bash process_data.sh <bench_name> <ckpt_name> <env_cfg_type> <action_type> [expert_data_num] [M1|Mn]
-
-# Example: M1 conversion with 3 episodes
-bash process_data.sh RoboDojo test_data arx_x5 joint 3 M1
-
-# Example: Mn conversion with all episodes (empty expert_data_num keeps all while passing task_type)
-bash process_data.sh RoboDojo cover_blocks arx_x5 joint "" Mn
+```python
+model.dump_memory()          # -> {episode_id: {"anchors": [ndarray, ...], "window": [...]}}
+model.dump_memory(eid)       # -> {"anchors": [...], "window": [...]} for one episode
+model.get_conflict_log()     # -> list of conflict-event dicts
 ```
 
-## Training
+Vectors are detached, cast to float32, and moved to CPU, so they are ready for PCA/UMAP.
 
-`train.sh` trains the execution module (torchrun, Qwen3-VL-2B), the planning module (LLaMA-Factory LoRA SFT + merge, Qwen3-VL-8B, Mn data), or `both` in sequence — the optional 7th argument `train_module` defaults to `both`. M1 tasks must pass `execution` explicitly; Mn tasks use `both`, or `planning` when execution weights already exist.
-
-```bash
-cd XPolicyLab/policy/Mem_0
-bash train.sh <bench_name> <ckpt_name> <env_cfg_type> <action_type> <seed> <gpu_id> [train_module]
-
-# Example: M1 execution-only training on GPU 0
-bash train.sh RoboDojo test_data arx_x5 joint 42 0 execution
-
-# Example: Mn full pipeline (execution first, then planning) on eight GPUs
-bash train.sh RoboDojo cover_blocks arx_x5 joint 42 0,1,2,3,4,5,6,7 both
-```
-
-Checkpoints follow the `checkpoints/<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>-<seed>/` convention. Execution tunables include `BATCH_SIZE`, `TRAIN_STEPS`, `NORM_STATS_PATH`, `REPO_ID`, and `ALLOW_NO_QWEN`; planning tunables include `LLAMAFACTORY_ROOT`, `CONDA_ENV_LLAMAFACTORY`, `EXPORT_DIR`, `ALLOW_NO_QWEN8B`, and `DRY_RUN` (see the `train.sh` header for the full list).
-
-## Evaluation
+## Minimal demo (no checkpoint, no simulator)
 
 ```bash
-cd XPolicyLab/policy/Mem_0
-bash eval.sh <bench_name> <task_name> <ckpt_name> <env_cfg_type> <action_type> <seed> \
-  <policy_gpu_id> <env_gpu_id> <policy_conda_env> <eval_env_conda_env> [planning_gpu_ids]
-
-# Example: evaluate a trained cotrain checkpoint on stack_bowls
-bash eval.sh RoboDojo stack_bowls RoboDojo-cotrain-arx_x5-joint-0 arx_x5 joint 0 0 0 <policy_conda_env> <eval_env_conda_env>
-
-# Example: Mn eval with auto-started vLLM planning server on GPUs 4-7
-bash eval.sh RoboDojo cover_blocks cover_blocks arx_x5 joint 0 0 0 mem0 XPolicyLab 4,5,6,7
+cd XPolicyLab/policy/MemConflict
+../../../.policy-venv/bin/python scripts/demo_memory_conflict.py
 ```
 
-The optional 11th argument `planning_gpu_ids` (comma-separated) auto-starts the vLLM planning server for Mn tasks; omit it for M1 or when `VLLM_URL` is already set.
+`scripts/demo_memory_conflict.py` feeds the bare `MemoryBank` a synthetic 2048-d episode whose
+window rotates 80° away from the anchor and prints, for each `resolution`, how many conflict
+events fire and how the anchor behaves. Expected outcome: `none`/`reweight_window` fire ~11 events
+with the anchor frozen at `t=0`; `refresh_anchor` fires ~2 and the anchor visibly re-anchors.
 
-`EVAL_ENV_TYPE=debug` runs the offline wiring check (no simulator); leave it unset or set `EVAL_ENV_TYPE=sim` for RoboDojo simulation. For split-machine deployment via `setup_eval_policy_server.sh` / `setup_eval_env_client.sh`, follow the [Deployment Flow](../../README.md#-deployment-flow).
+## Running the real policy (M1, `swap_blocks`)
 
-## Configuration
+`MemConflict` is a drop-in XPolicyLab adapter. Use the upstream `Mem_0` eval chain with
+`env_cfg_type=aloha_agilex` and the RMBench `m1_mix` checkpoint:
 
-`deploy.yml` keys to check before evaluation: `action_dim`, `device`, `image_size`, `norm_way`, `task_type`, `execution_ckpt`, `state_stats_path`, `planning_module_config_path`, `vllm_url`, `global_task`, `action_horizon`.
+- checkpoint: `qiuly/Mem-0-m1mix-RMBench` → reassemble the 9 parts, or use the slimmed
+  `m1_mix_inference.pt` (see the bundle `README.md`).
+- base VLM: `Qwen/Qwen3-VL-2B-Instruct` (`model.safetensors` must exist at
+  `Mem_0/checkpoints/Qwen3-VL-2B-Instruct/`; the config/processor files are enough to instantiate
+  the architecture, the checkpoint overwrites the weights).
+- `task_config.json` already lists `swap_blocks` as M1 (no planner / vLLM).
 
-`planning_module_config_path` must point at an existing file even for `M1`, because the upstream agent builds its planner unconditionally; the adapter fails at startup with an explicit message rather than inside OmegaConf. Override it with `MEM0_PLANNING_MODULE_CONFIG`.
+## Real sim results (M1, `swap_blocks`, 2 episodes × 999 steps)
 
-`eval_batch` is `false` and must stay that way: the MemoryBank is per-episode stateful, so `update_obs_batch` / `get_action_batch` raise `NotImplementedError`.
+Running the real policy (`MEMC_DUMP_MEMORY=true`, `test_num=2`) confirms the conflict is real and
+that `refresh_anchor` resolves it:
 
-## Deploy loop
+| resolution | conflict events (E1+E2) | `anchor_sim` end E1 | end E2 | success |
+| --- | --- | --- | --- | --- |
+| `none` (baseline) | 61 + 39 = **100** | 0.878 | 0.853 | 0/2 |
+| `refresh_anchor` | 1 + 1 = **2** | 0.987 | 0.992 | 0/2 |
+| `reweight_window` | 45 + 31 = **76** | 0.853 | 0.862 | 0/2 |
 
-Unlike other adapters, `deploy.py` drives evaluation through the custom RPCs `begin_episode` and `step` instead of `update_obs` / `get_action`, which is what lets the MemoryBank update between single actions and lets `Mn` switch subtasks on the server. `step` returns `None` between macro chunks and right after a subtask switch; the loop simply fetches a fresh observation and calls again. As with the standard methods, the policy server decodes camera images before these calls, so `model.py` must not decode.
+- **Conflict**: the task-initial anchor is frozen, so `cosine(anchor, latest window)` decays from
+  1.0 into the 0.83–0.87 band as the workspace visibly changes (`swap_blocks`), firing 100 conflict
+  events (first crossing of the 0.85 threshold at step ~68 / ~273).
+- **Resolution (hard)**: `refresh_anchor` re-anchors on the first conflict (~step 64 / 276);
+  `anchor_sim` jumps back to ~0.99 and stays there — a **50× reduction in conflict events**, with no
+  re-decay (a sawtooth reset instead of monotonic drift).
+- **Resolution (soft)**: `reweight_window` suppresses the anchor's *contribution to the action* on
+  conflict steps but leaves the stored anchor untouched, so its `anchor_sim` still decays like the
+  baseline (45 + 31 = 76 events). Its effect lives in the action branch, not in `anchor_sim`, and
+  needs success-rate differences to show (0/2 here).
+
+Success is 0/2 on both arms: `swap_blocks` is hard within its 999-step budget and two episodes are
+far too few to separate the arms on success — the quantitative signal here is the memory-level
+conflict count and trajectory, not the success rate.
+
+## Environment notes (no conda)
+
+The upstream `install.sh` pins `torch==2.6.0+cu124` and `flash-attn==2.6.1`, which **do not run on
+sm_120 (RTX 5090)**. This fork is run with:
+
+- **policy env** (`.policy-venv`: `transformers==4.57.1`, torch 2.7.1+cu128) — the model host,
+- **sim env** (`/opt/venv`: torch + sapien + warp + curobo) — the simulator client.
+
+The Qwen wrapper falls back from `flash_attention_2` to `sdpa` when `flash_attn` is absent, so no
+source build of flash-attn is required for inference.
+
+### Policy-env dependency pins (no conda)
+
+The upstream `install.sh` installs the *latest* `diffusers`, which pulls `huggingface-hub>=1.0`
+— but `transformers==4.57.1` (required by Qwen3-VL) pins `huggingface-hub<1.0`. The two
+conflict. Pin `diffusers==0.31.0` (keep `huggingface-hub<1.0`); the DiT only uses
+`ConfigMixin`/`ModelMixin`, which are stable across versions. Also install `h5py`, `rich`,
+`timm`, `openai`, `accelerate` — the execution module's import chain pulls them in even for M1
+inference (the agent builds its planner unconditionally).
+
+## Problems found while building this (so far)
+
+1. `install.sh`'s torch/cu124 + flash-attn 2.6.1 pin breaks sm_120 — had to reuse cu128.
+2. The `m1_mix` checkpoint ships as a 15.3 GB full-training `.pt` (incl. AdamW + scheduler);
+   inference only needs the ~5.1 GB `model_state_dict`.
+3. `hf download` stalled at ~35 % of `model.safetensors`; resuming with `curl -C -` from
+   `hf-mirror.com` (~4 MB/s) was reliable.
+4. Naming a config flag `dump_memory` collides with the `dump_memory()` probe method — the flag
+   is stored as `dump_memory_enabled`.
+5. `norm_stats.json` is 16-dim (model layout) but the adapter normalizes 14 arm dims; the bundle
+   README states "14 arm dimensions", so this matches — but verify before assuming.
+6. **`scripts` package collision.** The benchmark repo ships an empty `scripts/__init__.py`,
+   which turns `RMBench/scripts/` into a *regular* package that shadows the vendored
+   `Mem_0/scripts/` namespace, so `from scripts.tools_for_deploy...` can never resolve on
+   RMBench. Fixed in `model.py` by putting `scripts/tools_for_deploy` on `sys.path` and importing
+   the leaf modules (`image_utils`/`layout_utils`/`normlization`) directly.
+7. **Random-noise images don't trigger conflict.** Feeding the real model random images yields
+   `anchor_sim ≈ 0.98–1.0` (Qwen embeds "no object" similarly regardless of noise), so the
+   0.85 threshold never trips. Demonstrating memory conflict requires *genuine* task-state drift
+   (the simulator, where the blocks actually move), not synthetic noise. **Confirmed on the real
+   simulator**: `anchor_sim` decays to 0.83–0.87 in `swap_blocks`, so the 0.85 threshold is in the
+   right place for real drift.
+8. **Stale cuRobo asset paths in RMBench assets → infinite expert-check loop.** The benchmark's
+   `assets/embodiments/aloha-agilex/curobo_left.yml` and `curobo_right.yml` ship
+   `urdf_path` / `collision_spheres` pointing at `/home/ubuntu/Desktop/RoboHorizon/...` (the
+   original dev machine). On the first `play_once`, the scripted expert drives the robot, which
+   spawns the cuRobo motion-planner subprocess; that subprocess crashes with `FileNotFoundError`
+   on the missing path, the parent's multiprocessing `recv()` then raises
+   `ConnectionResetError`/`BrokenPipeError`, and `eval_policy_xpolicylab.py`'s
+   `eval_remote_policy` expert-check `except Exception` block just increments the seed and
+   `continue`s — so it spins `seed=405548,405549,…` forever without ever counting an episode.
+   Fix: rewrite those two lines in both files to `/root/workspace/RMBench/assets/...`. (The
+   `*_tmp.yml` templates use `${ASSETS_PATH}` but `robot.py` loads the non-`_tmp`
+   `curobo_left.yml`/`curobo_right.yml`, which had the hardcoded path.)
+

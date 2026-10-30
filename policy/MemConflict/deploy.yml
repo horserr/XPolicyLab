@@ -1,7 +1,7 @@
-# Mem_0 deployment config.
+# MemConflict deployment config (fork of Mem_0 with memory-conflict instrumentation).
 # policy_name MUST equal the policy folder/import name. Values set to null are
 # provided by setup_eval_policy_server.sh --overrides at launch time.
-policy_name: Mem_0
+policy_name: MemConflict
 protocol: ws
 
 # Server transport (setup_policy_server.py reads port/host).
@@ -50,6 +50,12 @@ execution_module:
     num_heads: 8
     dropout: 0.1
     memory_accumulation: 8
+    # MemoryConflict instrumentation (defaults reproduce upstream Mem_0 behavior exactly).
+    enable_window: true            # gate the sliding-window branch (recent history)
+    enable_anchor: true            # gate the anchor branch (task-initial state)
+    resolution: none               # none | reweight_window | refresh_anchor
+    dump_memory: false             # print anchor/window size + conflict score every step
+    conflict_threshold: 0.85       # cosine(anchor, latest window) below this = conflict
   action_model:
     action_model_type: DiT-B
     hidden_size: 2048
